@@ -5,209 +5,187 @@
 
 
 
-> > 根據目前提供的程式碼與需求，我觀察到您的 `get_greeks` 是針對「單一日期」進行計算的。若直接對 20 年的資料逐日計算 Greeks 可能會非常耗時。此外，資料中包含「一般」與「盤後」交易時段，且欄位格式（如千分位逗號）需要全域清洗。
-> > 我預設回測邏輯為：**「只在換倉日進行動作」**。即：在上個月的換倉日平倉舊部位、並同時建立下個月的新部位（Bear Call Spread）。中間持有期間不進行停損或停利（因為需求未提及），直到下個換倉日才結算。
+回測邏輯為：**「只在換倉日進行動作」**。即：在上個月的換倉日平倉舊部位、並同時建立下個月的新部位（Bear Call Spread）。中間持有期間不進行停損或停利（因為需求未提及），直到下個換倉日才結算。
+逐日回測，這代表架構將轉變為「事件驅動 (Event-Driven)」的形式。這種方式雖然運算較慢，但優點是能精確模擬真實交易情境（每天檢查訊號、計算每日市值變化），且非常適合未來擴充（例如加入停損、動態調整倉位）。
+> 
+> > 1. **資料清洗**：新增過濾期貨價差單（含 `/` 符號）的步驟。
+> > 2. **核心驅動**：廢除原本的「跳躍式」迴圈，改為 `market_stream_generator`。
+> > 3. **狀態管理**：因為是逐日讀取，策略函式需要一個「狀態機 (State Machine)」來記憶目前手上的部位。
+> > 
+> > 
 > 
 > 
 
-以下為您規劃的 Bear Call Spread 策略回測技術文檔。
+以下是修訂後的技術規格書：
 
 ---
 
-# 🐻 Bear Call Spread 策略回測技術規格書
+# Bear Call Spread 策略回測技術規格書 (v2.0 - Generator 版)
 
-## 1. 系統概述 (System Overview)
+## 1. 系統架構變更 (Architecture Shift)
 
-本系統旨在回測台指選擇權 (TXO) 的「空頭價差策略 (Bear Call Spread)」。系統將依據設定的 Delta 值選取賣方履約價，並依據固定點數寬度選取買方保護履約價。回測將模擬每月換倉邏輯，計算長期累積損益與交易明細。
+原先架構是「鎖定特定日期 -> 計算 -> 跳至下個特定日期」。
+新架構將分為三個層次：
 
-### 核心策略參數 (Parameters)
-
-| 參數名稱 | 變數名稱 | 預設值 | 說明 |
-| --- | --- | --- | --- |
-| 起始日期 | `START_DATE` | '2001-12-24' | 回測開始的時間點 |
-| 目標 Delta | `TARGET_DELTA` | 0.2 | 賣方 (Short Call) 尋找最接近此 Delta 的履約價 |
-| 價差寬度 | `FIX_WIDTH` | 200 | 買方 (Long Call) 履約價 = Short Strike + Width |
-| 換倉偏移天數 | `ROLLOVER_OFFSET` | 3 | 契約到期日前 N 個交易日進行換倉 |
-| 無風險利率 | `RISK_FREE_RATE` | 0.01 | 用於計算 BS Model 與 Greeks |
-| 合約乘數 | `MULTIPLIER` | 50 | 台指選擇權每一點的價值 |
+1. **Data Layer (Generator)**: 負責清洗資料、逐日計算 Greeks、拋出當日市場快照 (Snapshot)。
+2. **Strategy Layer (Consumer)**: 接收快照，判斷是否為換倉日，決定是否交易。
+3. **State Layer (Portfolio)**: 記錄當前持倉狀態、計算已實現損益。
 
 ---
 
-## 2. 資料結構定義 (Data Structures)
+## 2. 新增與修改的功能模組
 
-### 2.1 交易紀錄 (pnl_history)
+### 2.1 資料前處理模組 (Data Cleaning)
 
-`pnl_history` 將作為主要輸出結果，格式為 List of Dictionaries 或 DataFrame，每一列代表一次完整的「月合約操作損益」。
+需修改 `get_now_price` 並增加期貨清洗邏輯，確保不抓到價差單。
 
-| 欄位名稱 | 類型 | 說明 |
-| --- | --- | --- |
-| `trade_id` | int | 交易序號 |
-| `entry_date` | datetime | 進場日期 (即上個月的換倉日) |
-| `exit_date` | datetime | 出場日期 (即當月的換倉日) |
-| `contract_month` | str | 交易的合約月份 (e.g., '202206') |
-| `short_strike` | int | 賣出買權 (Sell Call) 的履約價 |
-| `long_strike` | int | 買進買權 (Buy Call) 的履約價 |
-| `short_entry_price` | float | 進場時 Short Call 價格 |
-| `long_entry_price` | float | 進場時 Long Call 價格 |
-| `short_exit_price` | float | 出場時 Short Call 價格 |
-| `long_exit_price` | float | 出場時 Long Call 價格 |
-| `entry_delta` | float | 進場時 Short Call 的實際 Delta |
-| `pnl_points` | float | 損益點數 = (建倉價差收點 - 平倉價差付點) |
-| `pnl_amount` | float | 實際損益金額 = pnl_points * MULTIPLIER |
-| `balance` | float | 策略累積權益數 |
+#### `clean_futures_data(df_fut)` **(New)**
 
----
-
-## 3. 功能模組設計 (Function Modules)
-
-為了達成回測目標，除了既有的 `get_greeks`、`weekday_count` 等工具外，需要新增以下功能函式：
-
-### 3.1 資料前處理模組
-
-**目標**：確保全域資料格式統一，過濾掉不必要的盤後資料，並建立日期索引。
-
-#### `preprocess_option_data(df_opt)`
-
-* **功能**：清洗選擇權資料，移除逗號，轉換數值型別，過濾非一般交易時段。
-* **輸入**：原始 `df_opt` (DataFrame)。
-* **輸出**：清洗後的 `df_opt` (DataFrame)。
+* **目標**：移除期貨資料中的價差組合單（Spread Orders）。
+* **輸入**：原始 `df_fut`。
+* **輸出**：乾淨的 `df_fut`。
 * **邏輯**：
-1. 篩選 `交易時段 == '一般'`。
-2. 將 `收盤價`, `履約價` 等欄位去除 ',' 並轉為 float/int。
-3. 將 `交易日期` 轉為 datetime 物件。
-4. 排序資料。
+1. 移除 `到期月份(週別)` 欄位中包含 `/` 字元的資料列 (例如 "202205/202206")。
+2. 移除 `契約` 欄位中包含 `/` 字元的資料列 (雙重確認)。
+3. 確保 `交易日期` 為 datetime 格式並排序。
 
 
 
-#### `get_all_settlement_months(df_fut, start_date)`
+#### `get_target_contract_price(df_fut_clean, date, contract_month)` **(Refined)**
 
-* **功能**：從期貨資料中找出所有需要交易的「合約月份」列表。
-* **輸入**：`df_fut`, `start_date`。
-* **輸出**：List (如 `['200201', '200202', ...]`)。
-* **邏輯**：從 `start_date` 開始，找出期貨資料中存在的所有近月合約代碼。
-
----
-
-### 3.2 訊號與選股模組 (Signal & Selection)
-
-**目標**：根據策略參數挑選具體的履約價。
-
-#### `identify_rollover_date(year, month, offset, trading_calendar)`
-
-* **功能**：計算指定合約月份的「換倉日」。
-* **輸入**：年份, 月份, `ROLLOVER_OFFSET`, 交易日曆 (從資料中提取的日期列表)。
-* **輸出**：`Target Date` (datetime)。
-* **邏輯**：
-1. 利用現有的 `weekday_count` 算出該月結算日 (第三個週三)。
-2. 在交易日曆中，往前推算 `offset` 個交易日 (排除非交易日)。
-
-
-
-#### `select_strategy_legs(df_opt_daily, target_delta, width, risk_free_rate, future_price)`
-
-* **功能**：在特定日期，挑選 Bear Call Spread 的兩隻腳。
-* **輸入**：
-* `df_opt_daily`: 當日的選擇權資料 (需包含 Call)。
-* `target_delta`: 目標 Delta (e.g., 0.2)。
-* `width`: 價差寬度 (e.g., 200)。
-* `future_price`: 當時期貨價格 (用於 Greeks 計算)。
-
-
-* **輸出**：Dictionary `{'short_k': ..., 'long_k': ..., 'short_price': ..., 'long_price': ..., 'actual_delta': ...}`
-* **邏輯**：
-1. 呼叫 `get_greeks` 計算當日所有 Call 的 Delta。
-2. **Short Leg**: 找到 `abs(Delta - target_delta)` 最小的履約價 ()。
-3. **Long Leg**: 計算 。
-4. 搜尋  的價格，若無精確履約價，則找最接近的。
-5. 回傳兩者的價格與履約價。
-
-
+* **目標**：取得特定日期、特定合約月份的期貨開盤/收盤價 (用於計算 Greeks 的 Underlying S)。
+* **輸入**：清洗後的期貨資料, 日期, 目標合約月份 (e.g., '202205')。
+* **輸出**：價格 (float)。
+* **注意**：若該遠月合約當日無成交，需有 fallback 機制 (抓當日近月價格調整或抓結算價)。
 
 ---
 
-### 3.3 回測執行模組 (Execution & PnL)
+### 2.2 市場資料生成器 (The Generator)
 
-**目標**：串接時間軸，計算損益。
+這是本次修改的核心。此 Generator 會「懶惰執行 (Lazy Execution)」，只有在迴圈跑到那一天時才計算那天的 Greeks。
 
-#### `calculate_period_pnl(entry_info, exit_info)`
+#### `market_data_generator(start_date, end_date, df_opt, df_fut, risk_free_rate)`
 
-* **功能**：計算單次交易的損益。
-* **輸入**：
-* `entry_info`: 進場時的部位資訊 (價格、履約價)。
-* `exit_info`: 出場時的部位資訊 (價格)。
-
-
-* **輸出**：損益點數 (float)。
-* **邏輯**：
-* **Credit Received (進場收權利金)** = 
-* **Cost to Close (出場付權利金)** = 
-* **PnL** = Credit Received - Cost to Close
-* *註：Bear Call Spread 進場是 Credit Strategy，希望價差縮小。*
-
-
-
-#### `run_backtest(df_opt, df_fut, params)`
-
-* **功能**：主控制迴圈。
-* **輸入**：原始資料表, 參數字典。
-* **輸出**：`pnl_history` (List of dicts), `equity_curve` (DataFrame)。
+* **目標**：按交易日序，逐日回傳當天的完整市場資訊。
+* **輸入**：回測區間、原始資料表、利率參數。
+* **輸出 (Yield)**：Tuple `(current_date, future_price, call_df_daily, put_df_daily)`。
 * **邏輯流程**：
-1. **Init**: 呼叫 `preprocess_option_data`。
-2. **Calendar**: 建立交易日曆與合約月份列表。
-3. **Loop**: 遍歷每一個合約月份 。
-* **決定日期**:
-* 本次進場日 () = 上個月 () 的換倉日。
-* 本次出場日 () = 本月 () 的換倉日。
+1. **Init**: 呼叫 `clean_futures_data`。
+2. **Timeline**: 找出 `df_fut` 與 `df_opt` 交集的「所有唯一交易日」列表，範圍限制在 `start_date` 到 `end_date`。
+3. **Loop**: 遍歷每一個 `trade_date`：
+* **Get Future Price (S)**: 取得當日「台指期近月」開盤價或收盤價 (作為 Greeks 計算基準)。若當日無期貨價格，跳過該日 (yield None or continue)。
+* **Filter Option**: 篩選出 `df_opt` 中 `交易日期 == trade_date` 的資料。
+* **Calc Greeks**: 呼叫既有的 `get_greeks(df_opt_daily, trade_date, S, risk_free_rate)`。
+* *註：這一步最耗時，但能確保策略端拿到的是有 Delta 的資料。*
 
 
-* **進場 (Open Position)**:
-* 在 ，針對合約 ，呼叫 `select_strategy_legs` 取得  及進場價。
+* **Yield**: `yield trade_date, S, call_df_with_greeks, put_df_with_greeks`。
 
 
-* **出場 (Close Position)**:
-* 在 ，針對合約 ，查詢  的收盤價。
-
-
-* **記錄**:
-* 呼叫 `calculate_period_pnl`。
-* 將結果存入 `pnl_history`。
-
-
-
-
-4. **Finalize**: 將 `pnl_history` 轉為 DataFrame 並計算累積損益。
 
 
 
 ---
 
-## 4. 技術注意事項 (Technical Constraints)
+### 2.3 策略邏輯與狀態管理 (Strategy Consumer)
 
-1. **Greeks 計算效能**：
-* 由於 `get_greeks` 包含數值解法 (Implied Volatility)，在迴圈中對整個 DataFrame 運算極慢。
-* **優化方案**：在 `select_strategy_legs` 中，只針對當天、特定到期月的 Call 進行 Greeks 計算，而非全歷史資料。
+因為改成逐日接收資料，我們需要一個變數來記住「我現在什麼時候要換倉？」以及「我現在手上有沒有單？」。
+
+#### 輔助函式：`get_rollover_info(current_date, contract_list)`
+
+* **目標**：判斷 `current_date` 是否為某個合約的換倉日。
+* **邏輯**：
+* 輸入當前日期，檢查它是否為「近月合約」的「倒數第 N 個交易日」。
+* 這需要預先建立一個 `TradingCalendar` (交易日曆表)，才能反推倒數日。
+* 回傳：`(is_rollover_day: bool, target_contract_to_close: str, target_contract_to_open: str)`。
+* *例如：如果是 5月的倒數第三天，回傳 (True, '202205', '202206')。*
 
 
-2. **資料缺失處理**：
-* 若換倉日當天某個履約價無成交 (Volume=0 或 Price=NaN)，應優先使用「結算價」，若無結算價則使用「最後最佳買賣價平均」，若仍無則標記為異常交易或以前一日價格填充。
+
+#### `run_backtest_generator(generator, params)`
+
+* **目標**：主程式，消耗 generator 並執行交易。
+* **變數 (State)**：
+* `current_position`: Dict (紀錄目前持有的 Short Call & Long Call 資訊，若無則為 None)。
+* `pnl_history`: List (交易紀錄)。
 
 
-3. **合約月份代碼匹配**：
-* 需小心處理台指選的週選 (e.g., '202205W1') 與月選 ('202205')。策略指定為「月選」，需明確過濾掉含有 'W' 的合約代碼。
+* **邏輯流程**：
+1. 建立 `calendar` (所有交易日列表)，用於判斷換倉日。
+2. **For** `date, S, calls, puts` **in** `generator`:
+* 若資料為 None，continue。
+* **Check Rollover**: 呼叫 `get_rollover_info(date)`。
+* **情境 A：是換倉日 (Rollover Day)**
+1. **平倉 (Close)**: 若 `current_position` 不為空：
+* 從 `calls` 中找到持有履約價的現在價格。
+* 計算損益，寫入 `pnl_history`。
+* 清空 `current_position`。
+
+
+2. **建倉 (Open)**:
+* 目標合約 = `target_contract_to_open` (下個月)。
+* 篩選 `calls` 中 `到期月份 == 目標合約` 的資料。
+* 依據 `TARGET_DELTA` 尋找 Short Leg。
+* 依據 `FIX_WIDTH` 尋找 Long Leg。
+* 記錄進場價格與履約價，更新 `current_position`。
+
+
+
+
+* **情境 B：非換倉日**
+* (可選) 更新每日市值 (Mark-to-Market) 至權益曲線。
+* 目前僅需 pass，等待下一次換倉訊號。
+
+
+
+
 
 
 
 ---
 
-## 5. 下一步建議 (Next Steps)
+## 3. 修改後的資料結構 (Data Structures)
 
-這份文檔確認後，我將開始撰寫程式碼。實作順序如下：
+### 3.1 Yield 的資料格式
 
-1. 實作 `preprocess_data` 與 `get_rollover_dates` 確保時間軸正確。
-2. 優化 `get_greeks` 的呼叫方式以適配單日篩選。
-3. 組合主迴圈 `run_backtest` 產出 `pnl_history`。
+Generator 每天吐出的資料：
 
+```python
+(
+    pd.Timestamp('2022-01-05'),  # Date
+    18200.0,                     # Underlying Future Price (S)
+    pd.DataFrame(...),           # Call DF (含 Greeks)
+    pd.DataFrame(...)            # Put DF (含 Greeks)
+)
 
+```
+
+### 3.2 持倉狀態 (Current Position State)
+
+在 Loop 內維護的字典：
+
+```python
+current_position = {
+    "contract_month": "202206",
+    "short_strike": 18500,
+    "long_strike": 18700,
+    "entry_price_short": 150.0,
+    "entry_price_long": 20.0,
+    "entry_date": pd.Timestamp('2022-05-18')
+}
+
+```
+
+---
+
+## 4. 總結開發步驟 (Development Roadmap)
+
+1. **Data Cleaning**: 優先實作 `clean_futures_data`，這是基礎。
+2. **Calendar Utils**: 實作「判斷某天是否為倒數第 N 個交易日」的邏輯，這需要先掃描一次所有日期建立索引。
+3. **Generator**: 實作 `market_data_generator`，並確認它能正確呼叫 `get_greeks` 且效能可接受（每秒可能只能跑幾天，取決於您的電腦與資料量）。
+4. **Loop & Trade**: 撰寫 `run_backtest_generator` 迴圈邏輯。
+
+這樣改動後，您的程式碼結構會更清晰，且未來要加入「停損監控 (每分鐘/每日)」時，只需要在 **情境 B** 裡面加入判斷邏輯即可，擴充性極佳。
 
 
 
