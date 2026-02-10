@@ -2,8 +2,244 @@
 一個專注於期權交易的系統，包含回測以及券商API串接
 
 ---
+# 使用文檔
 
 
+
+# 模組化選擇權回測框架技術手冊 (v1.0)
+
+## 1. 系統概述 (System Overview)
+
+本框架採用 **事件驅動 (Event-Driven)** 架構，將「交易策略 (Strategy)」與「回測執行 (Executor)」完全分離。
+
+* **Data Layer**: 負責清洗資料、計算 Greeks、並以 Generator 形式逐日提供市場快照。
+* **Strategy Layer**: 負責邏輯決策。接收市場數據，輸出交易訊號 (Signal)。
+* **Executor Layer**: 負責帳務處理。接收交易訊號，計算損益，維護部位狀態 (Portfolio)。
+
+---
+
+## 2. 核心資料結構 (Core Data Structures)
+
+在開發新策略前，必須理解系統內部溝通的標準格式。
+
+### 2.1 交易訊號 (Signal)
+
+這是 Strategy 傳遞給 Executor 的指令載體。
+
+```python
+class Signal:
+    def __init__(self, action, legs=None, note=""):
+        """
+        參數:
+            action (str): 'OPEN', 'CLOSE'
+            legs (list): 包含交易腳位的列表 (僅 OPEN 需要)。
+                         格式: [{'code': '202206', 'strike': 18000, 'side': 'sell', 'type': 'call'}, ...]
+            note (str): 訊號註記 (例如: 'Stop Loss', 'Monthly Entry')
+        """
+        self.action = action
+        self.legs = legs if legs else []
+        self.note = note
+
+```
+
+### 2.2 上下文資訊 (Context)
+
+Executor 傳遞給 Strategy 的環境資訊。
+
+* **`context['portfolio']`**: 當前持倉資訊 (Dict)。若空手則為 `None`。
+* 包含欄位：`entry_date`, `contract` (月份), `legs` (持倉明細), `pnl_unrealized` (未實現損益) 等。
+
+
+* **`context['is_rollover']`**: Boolean，今日是否為換倉日。
+
+---
+
+## 3. 資料處理模組 (Data Processing Module)
+
+### `clean_futures_data(df_raw)`
+
+* **功能**: 清洗期貨原始資料。移除價差單 (Spread Orders)，轉換數值格式。
+* **輸入**: `df_raw` (Pandas DataFrame) - 原始 CSV 讀入檔。
+* **輸出**: `df_clean` (Pandas DataFrame) - 包含 `交易日期`, `到期月份`, `開盤價` 等標準欄位。
+
+### `clean_options_data(df_raw)`
+
+* **功能**: 清洗選擇權原始資料。過濾盤後交易，計算 `dT` (剩餘時間)，轉換履約價為數值。
+* **輸入**: `df_raw` (Pandas DataFrame)。
+* **輸出**: `df_clean` (Pandas DataFrame)。
+
+### `market_data_generator(start, end, df_opt, df_fut, r)`
+
+* **功能**: 核心資料引擎。依序產出每日市場快照。
+* **輸入**:
+* `start_date`, `end_date`: 回測區間。
+* `df_opt`, `df_fut`: 清洗後的資料表。
+* `risk_free_rate`: 無風險利率 (用於 Greeks 計算)。
+
+
+* **輸出 (Yield)**:
+* `date` (Timestamp): 當前交易日。
+* `S` (float): 當日標的價格 (近月期貨)。
+* `calls` (DataFrame): 當日 Call 報價表 (含 Delta, Gamma, IV)。
+* `puts` (DataFrame): 當日 Put 報價表 (含 Delta, Gamma, IV)。
+
+
+
+---
+
+## 4. 策略開發介面 (Strategy Interface)
+
+若要開發新策略（如 Iron Condor），請繼承 `BaseStrategy` 並實作以下方法。
+
+### `class BaseStrategy`
+
+#### `on_bar(self, context, market_data)`
+
+* **觸發時機**: 每個非換倉日的交易日。
+* **用途**: 執行每日監控，如觸價停損 (Stop Loss)、移動停利 (Trailing Stop)。
+* **輸入**:
+* `context`: 當前持倉狀態。
+* `market_data`: Tuple `(date, S, calls, puts)`。
+
+
+* **輸出**: `List[Signal]` (若無動作則回傳空 list `[]`)。
+
+#### `on_rollover(self, context, market_data, rollover_info)`
+
+* **觸發時機**: 每月的換倉日。
+* **用途**: 執行轉倉邏輯 (平舊倉、建新倉)。
+* **輸入**:
+* `rollover_info`: Tuple `(close_contract, open_contract)`，指示應平倉月份與建倉月份。
+
+
+* **輸出**: `List[Signal]`。
+
+### 實作範例：開發一個簡單策略
+
+```python
+class MyNewStrategy(BaseStrategy):
+    def on_bar(self, context, market_data):
+        # 範例：若標的下跌超過 500 點就停損
+        date, S, _, _ = market_data
+        if context['portfolio'] and S < 10000: 
+             return [Signal(action='CLOSE', note='Panic Sell')]
+        return []
+
+    def on_rollover(self, context, market_data, rollover_info):
+        # 範例：固定換倉
+        signals = []
+        if context['portfolio']:
+            signals.append(Signal(action='CLOSE', note='Rollover Close'))
+        
+        # 建立新倉 (偽代碼)
+        new_leg = {'code': rollover_info[1], 'strike': 15000, 'side': 'buy', 'type': 'call'}
+        signals.append(Signal(action='OPEN', legs=[new_leg], note='Rollover Open'))
+        return signals
+
+```
+
+---
+
+## 5. 回測執行器 (Execution Engine)
+
+### `class BacktestExecutor`
+
+這是系統的「操作員」，一般使用者只需初始化並呼叫 `run()`，無需修改內部邏輯。
+
+#### `__init__(self, strategy, start_date, end_date, df_opt, df_fut)`
+
+* **功能**: 初始化回測環境，建立 Data Generator 與 Rollover Map。
+* **輸入**:
+* `strategy`: 實例化的策略物件 (如 `BearCallSpreadStrategy()`)。
+* 資料與日期參數。
+
+
+
+#### `run(self)`
+
+* **功能**: 啟動主迴圈。
+* **流程**:
+1. 從 Generator 獲取每日資料。
+2. 判斷是否為換倉日。
+3. 呼叫 Strategy 的 `on_bar` 或 `on_rollover` 取得訊號。
+4. 執行訊號：計算價格、扣除成本/收入權利金、更新部位狀態。
+5. 記錄交易明細。
+
+
+* **輸出**: `pd.DataFrame` (包含每一筆進出場的損益紀錄)。
+
+---
+
+## 6. 使用流程指南 (User Guide)
+
+### 步驟一：準備資料
+
+確保 `TXO_data.csv` 與 `TX_data.csv` 存在且格式正確。
+
+### 步驟二：載入與清洗
+
+```python
+df_opt = pd.read_csv('TXO_data.csv')
+df_fut = pd.read_csv('TX_data.csv')
+df_opt_clean = clean_options_data(df_opt)
+df_fut_clean = clean_futures_data(df_fut)
+
+```
+
+### 步驟三：定義策略
+
+```python
+# 實例化您想要的策略，並設定參數
+my_strategy = BearCallSpreadStrategy(target_delta=0.2, width=200)
+
+```
+
+### 步驟四：初始化執行器並運行
+
+```python
+executor = BacktestExecutor(
+    strategy=my_strategy,
+    start_date='2010-01-01',
+    end_date='2023-12-31',
+    df_opt=df_opt_clean,
+    df_fut=df_fut_clean
+)
+
+# 開始回測
+results = executor.run()
+
+```
+
+### 步驟五：分析結果
+
+```python
+print(f"總損益: {results['pnl_amount'].sum()}")
+results['cum_pnl'].plot()
+
+```
+
+---
+
+## 7. 常見問題與除錯 (Troubleshooting)
+
+* **Generator 報錯 "S is NaN"**:
+* 原因：當日找不到期貨價格。
+* 解法：檢查 `clean_futures_data` 是否過濾過度，或原始資料缺漏。
+
+
+* **建倉失敗 (Warning: No Leg Found)**:
+* 原因：目標 Delta (如 0.2) 找不到對應的履約價，或該履約價無資料。
+* 策略端解法：在 Strategy 中加入容錯機制，例如放寬 Delta 搜尋範圍。
+
+
+* **回測速度過慢**:
+* 原因：`get_greeks` 計算 IV 耗時。
+* 解法：Generator 中已實作每日切片，若仍慢可考慮減少回測年份或優化 Greeks 演算法。
+
+
+---
+
+# 開發文檔
 
 回測邏輯為：**「只在換倉日進行動作」**。即：在上個月的換倉日平倉舊部位、並同時建立下個月的新部位（Bear Call Spread）。中間持有期間不進行停損或停利（因為需求未提及），直到下個換倉日才結算。
 逐日回測，這代表架構將轉變為「事件驅動 (Event-Driven)」的形式。這種方式雖然運算較慢，但優點是能精確模擬真實交易情境（每天檢查訊號、計算每日市值變化），且非常適合未來擴充（例如加入停損、動態調整倉位）。
